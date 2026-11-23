@@ -14,10 +14,6 @@ For Samsung Galaxy devices on the protected stock kernel (One UI), rooted via [D
 > [!WARNING]
 > Test builds. Exploit + late-loaded kernel module can crash or bootloop your phone; keep stock firmware and a working Odin path ready. Not affiliated with upstream — don't report this fork's issues there.
 
-## Building
-
-Pushing to `main` builds the manager in CI (persistent release key); tagging `v*` cuts a release. PR/CI builds use throwaway keys and must be uninstalled before installing a different build.
-
 ## Credits
 
 - [tiann/KernelSU](https://github.com/tiann/KernelSU) — almost everything in this repo is upstream's work.
