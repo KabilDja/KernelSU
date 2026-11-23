@@ -18,19 +18,7 @@ void rkp_jb_init(void)
 
 #ifdef __aarch64__
 
-#include <linux/moduleloader.h>
 #include <linux/mutex.h>
-#include <linux/version.h>
-#include <linux/vmalloc.h>
-#include <linux/set_memory.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
-#include <linux/execmem.h>
-#define ksu_exec_alloc(sz) execmem_alloc(EXECMEM_MODULE_TEXT, (sz))
-#define ksu_exec_free(p) execmem_free(p)
-#else
-#define ksu_exec_alloc(sz) module_alloc(sz)
-#define ksu_exec_free(p) vfree(p)
-#endif
 #include "hook/patch_memory.h"
 
 struct ksu_branch_site {
@@ -49,11 +37,14 @@ struct ksu_branch_site {
  *                 BTI C otherwise (valid BLR target; NOP when BTI not enforced).
  */
 #define KSU_STUB_SIZE 16
+#define KSU_STUB_COUNT 256
+
+/* Defined in rkp_stubs.S, part of the loaded executable module image. */
+extern u8 ksu_rkp_stub_pool[];
 
 static struct ksu_branch_site ksu_sites[KSU_MAX_BRANCH_SITES];
 static int ksu_site_count;
 static DEFINE_MUTEX(ksu_site_lock);
-static void *ksu_stub_page;
 static int ksu_stub_next;
 
 static u32 ksu_encode_b(void *from, void *to)
@@ -151,23 +142,9 @@ int ksu_rkp_branch_patch(void *dst, void *src)
         return -ENOMEM;
     }
 
-    if (!ksu_stub_page) {
-        ksu_stub_page = ksu_exec_alloc(PAGE_SIZE);
-        if (!ksu_stub_page) {
-            mutex_unlock(&ksu_site_lock);
-            return -ENOMEM;
-        }
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-        set_memory_rox((unsigned long)ksu_stub_page, 1);
-#else
-        set_memory_ro((unsigned long)ksu_stub_page, 1);
-        set_memory_x((unsigned long)ksu_stub_page, 1);
-#endif
-    }
-
-    if (ksu_stub_next >= (int)(PAGE_SIZE / KSU_STUB_SIZE)) {
+    if (ksu_stub_next >= KSU_STUB_COUNT) {
         mutex_unlock(&ksu_site_lock);
-        pr_err("ksu: stub page full\n");
+        pr_err("ksu: stub pool full\n");
         return -ENOMEM;
     }
 
@@ -208,7 +185,7 @@ int ksu_rkp_branch_patch(void *dst, void *src)
     }
 
     stub_idx = ksu_stub_next++;
-    stub = ksu_stub_page + stub_idx * KSU_STUB_SIZE;
+    stub = ksu_rkp_stub_pool + stub_idx * KSU_STUB_SIZE;
 
     u32 stub_landing_pad = insn_at_fn0 ? insn_at_fn0 : 0xD503245F;
     u32 b_resume = ksu_encode_b(stub + 12, stub_resume);
@@ -219,14 +196,17 @@ int ksu_rkp_branch_patch(void *dst, void *src)
         return -ERANGE;
     }
 
-    /* Stub page is RO+X; write each word via fixmap (same path as kprobes).
-     * KCFI hash is copied from current_fn-4 so indirect callers pass the check.
-     * Stub is not yet reachable, so these writes don't need to be atomic with
-     * the live-function patch below. */
-    aarch64_insn_write((u8 *)stub + 0, *(u32 *)((u8 *)current_fn - 4));
-    aarch64_insn_write((u8 *)stub + 4, stub_landing_pad);
-    aarch64_insn_write((u8 *)stub + 8, insn_at_patch);
-    aarch64_insn_write((u8 *)stub + 12, b_resume);
+    /* Populate executable module text and synchronize instruction caches before
+     * publishing the live hook. Never expose a partially written trampoline. */
+    void *stub_addrs[4] = { stub, (u8 *)stub + 4, (u8 *)stub + 8, (u8 *)stub + 12 };
+    u32 stub_insns[4] = { *(u32 *)((u8 *)current_fn - 4), stub_landing_pad, insn_at_patch, b_resume };
+    ret = aarch64_insn_patch_text(stub_addrs, stub_insns, 4);
+    if (ret) {
+        ksu_stub_next--;
+        mutex_unlock(&ksu_site_lock);
+        pr_err("ksu: stub initialization failed for %pS: %d\n", current_fn, ret);
+        return ret;
+    }
 
     /* Commit fn+0 (BTI C, replacing PAC sign) and fn+preamble_skip (B new_fn)
      * in a single stop_machine so no CPU ever sees a partial state. */
@@ -257,16 +237,6 @@ int ksu_rkp_branch_patch(void *dst, void *src)
     return 0;
 }
 
-void ksu_rkp_branch_exit(void)
-{
-    if (ksu_stub_page) {
-        set_memory_nx((unsigned long)ksu_stub_page, 1);
-        ksu_exec_free(ksu_stub_page);
-        ksu_stub_page = NULL;
-        ksu_stub_next = 0;
-    }
-}
-
 void *ksu_rkp_get_stub(void *fn)
 {
     struct ksu_branch_site *site;
@@ -274,15 +244,14 @@ void *ksu_rkp_get_stub(void *fn)
 
     mutex_lock(&ksu_site_lock);
     site = ksu_find_site(fn);
-    if (site && ksu_stub_page)
-        result = ksu_stub_page + site->stub_idx * KSU_STUB_SIZE + 4;
+    if (site)
+        result = ksu_rkp_stub_pool + site->stub_idx * KSU_STUB_SIZE + 4;
     mutex_unlock(&ksu_site_lock);
     return result;
 }
 
 void rkp_jb_exit(void)
 {
-    ksu_rkp_branch_exit();
     static_branch_disable(&ksu_rkp_key);
 }
 
