@@ -330,6 +330,7 @@ call_orig:
 static int (*inode_doinit_with_dentry_fn)(struct inode *inode, struct dentry *dentry);
 static struct ksu_lsm_hook selinux_inode_setxattr_hook;
 typedef typeof(((union security_list_options *)0)->inode_setxattr) inode_setxattr_fn;
+static inode_setxattr_fn callthru_inode_setxattr;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 static int __nocfi my_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry, const char *name,
@@ -416,11 +417,11 @@ static int __nocfi my_inode_setxattr(struct dentry *dentry, const char *name, co
 
 call_orig:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-    return ((inode_setxattr_fn)selinux_inode_setxattr_hook.original)(idmap, dentry, name, value, size, flags);
+    return callthru_inode_setxattr(idmap, dentry, name, value, size, flags);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-    return ((inode_setxattr_fn)selinux_inode_setxattr_hook.original)(mnt_userns, dentry, name, value, size, flags);
+    return callthru_inode_setxattr(mnt_userns, dentry, name, value, size, flags);
 #else
-    return ((inode_setxattr_fn)selinux_inode_setxattr_hook.original)(dentry, name, value, size, flags);
+    return callthru_inode_setxattr(dentry, name, value, size, flags);
 #endif
 }
 
@@ -590,6 +591,13 @@ static int ksu_selinux_hide_enable()
         pr_err("selinux_hide: init: selinux_inode_setxattr_hook err: %d\n", ret);
         goto unhook;
     }
+    callthru_inode_setxattr = static_branch_unlikely(&ksu_rkp_key) ?
+                                  (inode_setxattr_fn)ksu_rkp_get_stub(selinux_inode_setxattr_hook.original) :
+                                  (inode_setxattr_fn)selinux_inode_setxattr_hook.original;
+    if (!callthru_inode_setxattr) {
+        pr_err("selinux_hide: init: no callthru for selinux_inode_setxattr\n");
+        goto unhook;
+    }
 
     return 0;
 
@@ -603,6 +611,7 @@ static void ksu_selinux_hide_unhook()
     int ret;
 
     ksu_lsm_unhook(&selinux_inode_setxattr_hook);
+    callthru_inode_setxattr = NULL;
     if (orig_context_write) {
         ret =
             ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
