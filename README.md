@@ -1,5 +1,7 @@
 # KernelSU — Samsung late-load fork
 
+<img src="website/docs/public/logo.png" style="width: 96px;" alt="logo">
+
 **Vanilla KernelSU app + kernel module, unchanged from upstream, with exactly one addition: Samsung late-load support.** No extra patches, no behavior changes. The manager's update checker points at this fork's releases, so an update can never install an upstream build that drops Samsung support.
 
 One build targets all supported Samsung devices; device and kernel differences are detected at runtime, not build time.
